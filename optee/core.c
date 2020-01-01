@@ -108,6 +108,11 @@ err:
 	return ERR_PTR(rc);
 }
 
+static const struct of_device_id optee_match[] = {
+	{ .compatible = "linaro.optee-tz" },
+	{},
+};
+
 static int __init optee_driver_init(void)
 {
 	struct device_node *fw_np;
