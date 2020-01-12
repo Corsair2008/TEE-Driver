@@ -1,6 +1,13 @@
 #ifndef TEE_PRIVATE_H
 #define TEE_PRIVATE_H
 
+struct tee_shm_pool_mgr;
+
+struct tee_shm_pool {
+	struct tee_shm_pool_mgr private_mgr;
+	struct tee_shm_pool_mgr dma_buf_mgr;
+};
+
 struct tee_device {
 	char name[TEE_MAX_DEV_NAME_LEN];
 	const struct tee_desc *desc;

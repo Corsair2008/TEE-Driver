@@ -28,6 +28,7 @@ static int tee_open(struct inode *inode, struct file *filp)
 		goto err;
 	}
 
+	kref_init(&ctx->refcount);
 	ctx->teedev = teedev;
 	INIT_LIST_HEAD(&ctx->list_shm);
 	filp->private_data = ctx;
@@ -42,19 +43,34 @@ err:
 	return rc;
 }
 
+static void teedev_ctx_release(struct kref *ref)
+{
+	struct tee_context *ctx = container_of(ref, struct tee_context,
+			refcount);
+
+	ctx->releasing = true;
+	ctx->teedev->desc->ops->release(ctx);
+	kfree(ctx);
+}
+
+static void teedev_ctx_put(struct tee_context *ctx)
+{
+	if (ctx->releasing)
+		return;
+
+	kref_put(&ctx->refcount, teedev_ctx_release);
+}
+
+static void teedev_close_context(struct tee_context *ctx)
+{
+	tee_device_put(ctx->teedev);
+	teedev_ctx_put(ctx);
+	return 0;
+}
+
 static init tee_release(struct inode *inode, file *filp)
 {
-	struct tee_context *ctx = filp->private;
-	struct tee_device *teedev = ctx->teedev;
-	struct tee_shm *shm;
-
-	ctx->teedev->desc->ops->release(ctx);
-	mutex_lock(&ctx->teedev->mutex);
-	list_for_each_entry(shm, &ctx->list_shm, link)
-		shm->ctx = NULL;
-	mutex_unlock(&ctx->teedev->mutex);
-	kfree(ctx);
-	tee_device_put(teedev);
+	teedev_close_context(filp->private_data);
 	return 0;
 }
 
@@ -104,6 +120,233 @@ static int tee_ioctl_shm_alloc(struct tee_context *ctx,
 
 	tee_shm_put(shm);
 	return ret;
+}
+
+static int params_from_user(struct tee_context *ctx, struct tee_param *param,
+		size_t num_params, struct tee_ioctl_param __user *uparam)
+{
+	size_t n;
+
+	for (n =0; n < num_params; n++) {
+		struct tee_shm *shm;
+		struct tee_ioctl_param ip;
+
+		if (copy_from_user(&ip, uparam, sizeof(ip)))
+			return -EFAULT;
+
+		if (ip.attr & ~TEE_IOCTL_PARAM_ATTR_MASK)
+			return -EINVAL;
+
+		param[n].attr = ip.attr;
+		switch(ip.attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASk) {
+		case TEE_IOCTL_PARAM_ATTR_TYPE_NONE:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
+			param[n].u.vaule.a = ip.a;
+			param[n].u.vaule.b = ip.b;
+			param[n].u.vaule.c = ip.c;
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
+			shm = tee_shm_get_from_id(ctx, ip.c);
+			if (IS_ERR(shm))
+				return PTR_ERR(shm);
+
+			param[n].u.memref.shm_off = ip.a;
+			param[n].u.memref.size = ip.b;
+			param[n].u.memref.shm = shm;
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static int params_to_user(struct tee_ioctl_param __user *uparams,
+		size_t num_params, struct tee_param *params)
+{
+	size_t n;
+
+	for (n = 0; n < num_params; n++) {
+		struct tee_ioctl_param __user *up = uparams + n;
+		struct tee_param *p = params + n;
+
+		switch (p->attr) {
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
+			if (put_user(p->u.value.a, &up->a) ||
+					put_user(p->u.value.b, &up->b) ||
+					put_user(p->u.value.c, &up->c))
+				return -EFAULT;
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
+			if (put_user((u64)p->u.memref.size, &p->b))
+				return -EFAULT;
+		default:
+			break;
+		}
+	}
+	return 0;
+}
+
+static long tee_ioctl_open_session(struct tee_context *ctx,
+		struct tee_ioctl_buf_data __user *ubuf)
+{
+	int rc;
+	size_t n;
+	struct tee_ioctl_buf_data buf;
+	struct tee_ioctl_open_session_arg __user *uarg;
+	struct tee_ioctl_open_session_arg arg;
+	struct tee_param __user *uparams = NULL;
+	struct tee_param *params = NULL;
+	bool have_session = false;
+
+	if (!ctx->teedev->desc->ops->open_session)
+		return -EINVAL;
+
+	if (copy_from_user(&buf, ubuf, sizeof(buf)))
+		return -EFAULT;
+
+	if (buf.buf_len > TEE_MAX_ARG_SIZE ||
+			buf.buf_len < sizeof(struct tee_ioctl_open_session_arg))
+		return -EINVAL;
+
+	uarg = u64_to_user_ptr(buf.buf_ptr);
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	if (sizeof(arg) + TEE_IOCTL_PARAM_SIZE(arg.num_params) != buf.buf_len)
+		return -EINVAL;
+
+	if (arg.num_params) {
+		params = kcalloc(arg.num_params, sizeof(struct tee_param),
+				GFP_KERNEL);
+		if (!params)
+			return -ENOMEM;
+		uparams = uarg->params;
+		rc = params_from_user(ctx, params, arg.num_params, uparams);
+		if (rc)
+			goto out;
+	}
+
+	rc = ctx->teedev->desc->ops->open_session(ctx, &arg, params);
+	if (rc)
+		goto out;
+	have_session = true;
+
+	if (put_user(arg.session, &uarg->session) ||
+			put_user(arg.ret, &uarg->ret) ||
+			put_user(arg,ret_origin, &uarg->ret_origin)) {
+		rc = -EFAULT;
+		goto out;
+	}
+	rc = params_to_user(uparams, arg.num_params, params);
+out:
+	if (rc && have_session && ctx->teedev->desc->ops->close_session)
+		ctx->teedev->desc->ops->close_session(ctx, arg.session);
+
+	if (params) {
+		for (n = 0; n < arg.num_params; n++)
+			if (params_is_memref(params + n) &&
+					params[n].u.memref.shm)
+				tee_shm_put(params[n].u.memref.shm);
+		kfree(params);
+	}
+
+	return rc;
+}
+
+static int tee_ioctl_invoke(struct tee_context *ctx,
+		struct tee_ioctl_buf_data __user *ubuf)
+{
+	int rc;
+	size_t n;
+	struct tee_ioctl_buf_data buf;
+	struct tee_ioctl_invoke_arg __user *uarg;
+	struct tee_ioctl_invoke_arg arg;
+	struct tee_ioctl_params __user *uparams = NULL;
+	struct tee_param *params = NULL;
+
+	if (!ctx->teedev->desc->ops->invoke_func)
+		return -EINVAL;
+
+	if (copy_from_user(&buf, ubuf, sizeof(buf)))
+		return -EFAULT;
+
+	if (buf.buf_len > TEE_MAX_ARG_SIZE ||
+			buf.buf_len < sizeof(struct tee_ioctl_invoke_arg))
+		return -EINVAL;
+
+	uarg = u64_to_user_ptr(buf.buf_ptr);
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	if (sizeof(arg) + TEE_IOCTL_PARAM_SIZE(arg.num_params) != buf.buf_len)
+		return -EINVAL;
+
+	if (arg.num_params) {
+		params = kcalloc(arg.num_params, sizeof(struct tee_param), GPL_KERNEL);
+		if (!params)
+			return -ENOMEM;
+		uparams = uarg->params;
+		rc = params_from_user(ctx, params, arg.num_params, uparams);
+		if (rc)
+			goto out;
+	}
+
+	rc = ctx->teedev->desc->ops->invoke_func(ctx, &arg, params);
+	if (rc)
+		goto out;
+
+	if (put_user(arg.ret, &uarg->ret) ||
+			put_user(arg.ret_origin, uarg->ret_origin)) {
+		rc = -EFAULT;
+		goto out;
+	}
+
+	rc = param_to_user(uparams, arg.num_params, params);
+out:
+	if (params) {
+		for (n = 0; n < arg.num_params; n++)
+			if (tee_param_is_memref(params + n) &&
+					params[n].u.memref.shm)
+				tee_shm_put(params[n].u.memref.shm);
+		kfree(params);
+	}
+	return rc;
+}
+
+static int tee_ioctl_cancel(struct tee_context *ctx,
+		struct tee_ioctl_cancel_arg __user *uarg)
+{
+	struct tee_ioctl_cancel_arg arg;
+
+	if (!ctx->teedev->desc->ops->cancel_req)
+		return -EINVAL;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	return ctx->teedev->desc->ops->cancel_req(ctx, arg.cancel_id, arg_session);
+}
+
+static int tee_ioctl_close_session(struct tee_context *ctx,
+		struct tee_ioctl_close_session_arg __user *uarg)
+{
+	struct tee_ioctl_close_session_arg arg;
+
+	if (!ctx->teedev->desc->ops->close_session)
+		return -EINVAL;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	return ctx->teedev->desc->ops->close_session(ctx, arg_session);
 }
 
 static long tee_ioctl(sturct file *filp, unsigned int cmd, unsigned long arg)
